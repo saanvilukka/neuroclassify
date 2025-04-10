@@ -9,6 +9,7 @@ from datetime import datetime
 import time
 import json
 import getpass
+import shutil
 username = getpass.getuser()
 
 ##### SET UP ######
@@ -60,7 +61,8 @@ namemap = {
     's5-1': 'V12U21-016_B1_s5-1',
     's5-2': 'V12U21-120-A1_s5-2',
     's6-1': 'V12U21-016_D1_s6-1',
-    's6-2': 'V12U21-120-C1_s6-2'
+    's6-2': 'V12U21-120-C1_s6-2',
+    'VM4-2': 'VM4-2'
 }  
 
                     
@@ -71,7 +73,7 @@ namemap_int = {v: k for k, v in namemap.items()}
 dir_path = Path(rf'C:\Users\\{username}\Box\diana_collaboration_DATA')
 
 # REPLACE PATH HERE
-preproc_path = Path(r"C:\Users\MEYERSE\Box\diana_collaboration_DATA\1_preprocessing")
+preproc_path = Path("preprocess")
 #Folder to original tifs
 tifs_path = preproc_path / 'Data'
 barcodes_path = preproc_path / 'barcodes'
@@ -85,7 +87,7 @@ generated_subjects = set(['_'.join(x.stem.split('_')[:3]) for x in barcode_iso_p
 tif_list = list(tifs_path.glob('*.tif'))
 
 #REPLACE PATH HERE
-json_path = Path(r'C:\Users\MEYERSE\Box\diana_collaboration_DATA\Spatial_info')
+json_path = Path("output")
 
 
 
@@ -129,16 +131,19 @@ for img in tif_list:
     barcode_pixel_radius = round(barcode_pixel_diameter/2)
 
     img_barcode_path = barcodes_path / f'{img.stem}.csv'
-    colnames=['ID', 'over_tissue', 'x_coord', 'y_coord', 'x', 'y'] 
+    colnames=['Barcode', 'X_Coordinate', 'Y_Coordinate'] 
     locsdf = pd.read_csv(img_barcode_path, names=colnames, header=None)
 
-    if locsdf['x'].iloc[0] == 'pxl_row_in_fullres':
-        locsdf = locsdf.iloc[1:]
-        locsdf[['x', 'y', 'x_coord', 'y_coord', 'over_tissue']] = locsdf[['x', 'y', 'x_coord', 'y_coord', 'over_tissue']].apply(pd.to_numeric)
-        locsdf.reset_index(drop=True)
+    # if locsdf['x'].iloc[0] == 'pxl_row_in_fullres':
+    #     locsdf = locsdf.iloc[1:]
+    #     locsdf[['x', 'y', 'x_coord', 'y_coord', 'over_tissue']] = locsdf[['x', 'y', 'x_coord', 'y_coord', 'over_tissue']].apply(pd.to_numeric)
+    #     locsdf.reset_index(drop=True)
 
     #Get just barcodes over tissue
-    bcdf = locsdf.loc[locsdf['over_tissue'] == 1]
+    locsdf = locsdf.iloc[1:]
+    locsdf[['X_Coordinate', 'Y_Coordinate']] = locsdf[['X_Coordinate', 'Y_Coordinate']].apply(pd.to_numeric)
+    bcdf = locsdf
+    
     im = cv2.imread(str(img))
 
     print(f'Starting {img_name}')
@@ -147,10 +152,10 @@ for img in tif_list:
 
         im_cropped = np.asarray([])
 
-        left = int(row['y'] - target_image_width/2)
-        right = int(row['y'] + target_image_width/2)
-        bottom = int(row['x'] + target_image_height/2)
-        top = int(row['x'] - target_image_height/2)
+        left = int(row['Y_Coordinate'] - target_image_width/2)
+        right = int(row['Y_Coordinate'] + target_image_width/2)
+        bottom = int(row['X_Coordinate'] + target_image_height/2)
+        top = int(row['X_Coordinate'] - target_image_height/2)
 
         center_x = round(target_image_width / 2)
         center_y = round(target_image_height / 2)
@@ -169,9 +174,59 @@ for img in tif_list:
         added_image = cv2.addWeighted(im_cropped_copy,0.8,backtorgb,0.2,0)
         cv2.circle(added_image, (center_y-1, center_x-1), barcode_pixel_radius, (0, 0, 255), 1)
 
-        bcd_id = row['ID']
+        bcd_id = row['Barcode']
         
         cv2.imwrite(str(barcode_iso_overlap_path / f'{img_name}_{bcd_id}.png'), added_image)
 
 
+# Create a directory to move non-tissue images (instead of deleting)
+non_tissue_path = Path("preprocess/non_tissue_images")
+
+non_tissue_path.mkdir(exist_ok=True)
+
+# Get all png images
+images = list(barcode_iso_overlap_path.glob("*.png"))
+print(f"Found {len(images)} images to analyze")
+
+removed_count = 0
+kept_count = 0
+
+# Process each image - focusing primarily on whiteness
+for img_path in images:
+    # Load image
+    img = cv2.imread(str(img_path))
+    if img is None:
+        print(f"Failed to load image: {img_path}")
+        continue
+    
+    # Extract the center region where the spot is located
+    h, w = img.shape[:2]
+    center_y, center_x = h//2, w//2
+    radius = 94  # Standard barcode_pixel_radius
+    
+    # Create a mask for the spot area
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (center_x, center_y), radius, 255, -1)
+    
+    # Calculate mean brightness of the spot area (higher = whiter)
+    mean_brightness = np.mean(img[mask > 0])
+    
+    # More lenient threshold - focusing primarily on whiteness
+    # Images with mean brightness > 240 are considered "mostly white"
+    is_white = mean_brightness > 230
+    
+    if not is_white:
+        kept_count += 1
+    else:
+        # Move to non-tissue folder
+        shutil.move(str(img_path), str(non_tissue_path / img_path.name))
+        removed_count += 1
+    
+    # Print progress
+    if (removed_count + kept_count) % 100 == 0:
+        print(f"Processed {removed_count + kept_count} images...")
+
+print(f"Processing complete:")
+print(f"- Kept {kept_count} images with tissue")
+print(f"- Moved {removed_count} images that are mostly white to {non_tissue_path}")
 print('finished')
